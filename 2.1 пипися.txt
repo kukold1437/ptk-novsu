@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# =============================================================================
+# ПРОСТАЯ СИСТЕМА ЗАЩИТЫ SSH
+# =============================================================================
+
+# Конфигурация
+LOG_DIR="/var/log"
+LOG_FILE="$LOG_DIR/ssh_defense.log"
+FAILED_THRESHOLD=3
+BAN_TIME=600  # 10 минут для тестирования
+WHITELIST_FILE="/opt/security/whitelist.txt"
+BLACKLIST_FILE="/opt/security/blacklist.txt"
+
+# Создаем все необходимые директории и файлы
+echo "Создание директорий и файлов..."
+mkdir -p /opt/security
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+touch "$WHITELIST_FILE"
+touch "$BLACKLIST_FILE"
+
+# Функция логирования
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# Функция проверки whitelist
+is_whitelisted() {
+    local ip=$1
+    grep -q "^$ip$" "$WHITELIST_FILE" 2>/dev/null
+}
+
+# Функция блокировки IP
+block_ip() {
+    local ip=$1
+    local reason=$2
+    
+    log "Блокировка IP: $ip (Причина: $reason)"
+    
+    # Добавляем в blacklist
+    echo "$ip|$(date +%s)|$reason" >> "$BLACKLIST_FILE"
+    
+    # Блокируем с iptables
+    if command -v iptables >/dev/null 2>&1; then
+        if ! iptables -L INPUT -n | grep -q "$ip"; then
+            iptables -A INPUT -s "$ip" -j DROP
+            log "IPTABLES: Заблокирован $ip"
+        fi
+    else
+        log "WARNING: iptables не найден"
+    fi
+    
+    # Пробуем ufw
+    if command -v ufw >/dev/null 2>&1; then
+        ufw deny from "$ip"
+        log "UFW: Заблокирован $ip"
+    fi
+}
+
+# Функция разблокировки IP
+unblock_ip() {
+    local ip=$1
+    local current_time=$(date +%s)
+    
+    log "Разблокировка IP: $ip"
+    
+    # Удаляем из blacklist
+    if [ -f "$BLACKLIST_FILE" ]; then
+        grep -v "^$ip|" "$BLACKLIST_FILE" > "$BLACKLIST_FILE.tmp"
+        mv "$BLACKLIST_FILE.tmp" "$BLACKLIST_FILE"
+    fi
+    
+    # Разблокируем в iptables
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -s "$ip" -j DROP 2>/dev/null
+    fi
+    
+    # Разблокируем в ufw
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete deny from "$ip" 2>/dev/null
+    fi
+}
+
+# Функция автоматической разблокировки
+auto_unblock() {
+    local current_time=$(date +%s)
+    local unblocked=0
+    
+    if [ ! -f "$BLACKLIST_FILE" ]; then
+        return
+    fi
+    
+    while IFS='|' read -r ip ban_time reason; do
+        if [ -n "$ip" ]; then
+            if [ $((current_time - ban_time)) -gt $BAN_TIME ]; then
+                log "Авторазблокировка: $ip (время истекло)"
+                unblock_ip "$ip"
+                ((unblocked++))
+            fi
+        fi
+    done < "$BLACKLIST_FILE"
+    
+    [ $unblocked -gt 0 ] && log "Авторазблокировано IP: $unblocked"
+}
+
+# Функция мониторинга сетевых соединений
+monitor_connections() {
+    log "Запуск мониторинга сетевых соединений..."
+    
+    while true; do
+        # Мониторим активные соединения на порту 22
+        if command -v ss >/dev/null 2>&1; then
+            connections=$(ss -tn state established sport = :22 2>/dev/null | awk '{print $5}' | cut -d: -f1 | grep -v Address | sort | uniq -c | sort -nr)
+        elif command -v netstat >/dev/null 2>&1; then
+            connections=$(netstat -tn 2>/dev/null | grep ':22 ' | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr)
+        else
+            log "ERROR: Не найдены ss или netstat"
+            sleep 60
+            continue
+        fi
+        
+        # Анализируем соединения
+        echo "$connections" | while read count ip; do
+            if [ -n "$ip" ] && [ "$count" -gt 2 ]; then
+                if ! is_whitelisted "$ip"; then
+                    log "Подозрительная активность: $ip имеет $count соединений"
+                    block_ip "$ip" "Множественные соединения ($count)"
+                fi
+            fi
+        done
+        
+        # Авторазблокировка
+        auto_unblock
+        
+        sleep 30
+    done
+}
+
+# Функция показа статуса
+show_status() {
+    echo "=== СТАТУС СИСТЕМЫ ЗАЩИТЫ SSH ==="
+    
+    # Проверка процесса
+    if [ -f /var/run/ssh_defense.pid ]; then
+        pid=$(cat /var/run/ssh_defense.pid)
+        if ps -p "$pid" >/dev/null 2>&1; then
+            echo "✓ Служба работает (PID: $pid)"
+        else
+            echo "✗ Процесс не найден"
+            rm -f /var/run/ssh_defense.pid
+        fi
+    else
+        echo "✗ Служба остановлена"
+    fi
+    
+    echo ""
+    echo "Заблокированные IP:"
+    if [ -f "$BLACKLIST_FILE" ] && [ -s "$BLACKLIST_FILE" ]; then
+        while IFS='|' read -r ip ban_time reason; do
+            time_left=$((BAN_TIME - ($(date +%s) - ban_time)))
+            if [ $time_left -gt 0 ]; then
+                echo "  $ip - $(($time_left/60)) мин. - $reason"
+            fi
+        done < "$BLACKLIST_FILE"
+    else
+        echo "  Нет заблокированных IP"
+    fi
+    
+    echo ""
+    echo "IP в whitelist:"
+    if [ -f "$WHITELIST_FILE" ] && [ -s "$WHITELIST_FILE" ]; then
+        cat "$WHITELIST_FILE" | sed 's/^/  /'
+    else
+        echo "  Whitelist пуст"
+    fi
+}
+
+# Функция тестирования
+test_system() {
+    log "=== ТЕСТИРОВАНИЕ СИСТЕМЫ ==="
+    
+    # Тестовые IP
+    test_ips=("8.8.8.8" "1.1.1.1" "10.0.0.99")
+    
+    for ip in "${test_ips[@]}"; do
+        if ! is_whitelisted "$ip"; then
+            log "ТЕСТ: Блокировка $ip"
+            block_ip "$ip" "Тестовая блокировка"
+            sleep 1
+        fi
+    done
+    
+    log "ТЕСТ: Завершено"
+}
+
+# Основная логика
+case "${1:-status}" in
+    start)
+        if [ -f /var/run/ssh_defense.pid ]; then
+            echo "Служба уже запущена (PID: $(cat /var/run/ssh_defense.pid))"
+            exit 0
+        fi
+        
+        log "=== ЗАПУСК СИСТЕМЫ ЗАЩИТЫ SSH ==="
+        monitor_connections &
+        echo $! > /var/run/ssh_defense.pid
+        echo "Служба запущена (PID: $!)"
+        ;;
+        
+    stop)
+        if [ -f /var/run/ssh_defense.pid ]; then
+            pid=$(cat /var/run/ssh_defense.pid)
+            kill "$pid" 2>/dev/null
+            rm -f /var/run/ssh_defense.pid
+            log "Служба остановлена"
+            echo "Служба остановлена"
+        else
+            echo "Служба не запущена"
+        fi
+        ;;
+        
+    unblock)
+        if [ -n "$2" ]; then
+            unblock_ip "$2"
+            echo "Разблокирован IP: $2"
+        else
+            echo "Использование: $0 unblock <IP>"
+        fi
+        ;;
+        
+    whitelist)
+        if [ -n "$2" ]; then
+            if ! grep -q "^$2$" "$WHITELIST_FILE"; then
+                echo "$2" >> "$WHITELIST_FILE"
+                echo "Добавлен в whitelist: $2"
+                log "Whitelist: добавлен $2"
+            else
+                echo "IP уже в whitelist: $2"
+            fi
+        else
+            echo "Использование: $0 whitelist <IP>"
+        fi
+        ;;
+        
+    test)
+        test_system
+        ;;
+        
+    status)
+        show_status
+        ;;
+        
+    log)
+        if [ -f "$LOG_FILE" ]; then
+            tail -20 "$LOG_FILE"
+        else
+            echo "Лог файл не найден: $LOG_FILE"
+        fi
+        ;;
+        
+    *)
+        echo "Использование: $0 {start|stop|status|unblock|whitelist|test|log}"
+        echo "  start     - запустить службу"
+        echo "  stop      - остановить службу"
+        echo "  status    - показать статус"
+        echo "  unblock IP - разблокировать IP"
+        echo "  whitelist IP - добавить IP в whitelist"
+        echo "  test      - тестирование системы"
+        echo "  log       - показать лог"
+        exit 1
+        ;;
+esac
